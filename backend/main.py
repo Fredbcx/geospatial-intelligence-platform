@@ -5,9 +5,19 @@ from typing import List, Optional
 from sqlalchemy.orm import Session
 from geoalchemy2.shape import to_shape
 import requests
-from datetime import datetime
+from datetime import datetime, timezone  
 import os
 from dotenv import load_dotenv
+from scheduler import start_scheduler, stop_scheduler, get_scheduler_status, trigger_job_now
+from spatial_queries import (
+    get_aircraft_in_viewport,
+    get_aircraft_near_point,
+    get_aircraft_trajectory,
+    get_density_heatmap,
+    get_spatial_stats,
+    get_busiest_routes
+)
+
 
 load_dotenv()
 
@@ -38,12 +48,9 @@ class AircraftPosition(BaseModel):
     on_ground: bool
     last_update: datetime
 
-# ============ DATABASE STARTUP EVENT ============
-# Questo viene eseguito SOLO quando FastAPI parte, non all'import!
-
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database connection on startup"""
+    """Initialize database and start scheduler on startup"""
     print("=" * 50)
     print("🚀 STARTUP EVENT TRIGGERED")
     print("=" * 50)
@@ -60,21 +67,54 @@ async def startup_event():
             print("🔄 Initializing database tables...")
             init_db()
             print("✅ Database initialized successfully")
+            
+            # START SCHEDULER - NUOVO!
+            print("🔄 Starting background scheduler...")
+            start_scheduler(interval_minutes=5)  # Fetch every 5 minutes
+            print("✅ Scheduler started successfully")
+            
         else:
             print("⚠️  Database connection failed - running in API-only mode")
             
     except ImportError as e:
         print(f"❌ Import error: {e}")
-        print("⚠️  Running in API-only mode (database modules not available)")
+        print("⚠️  Running in API-only mode")
     except Exception as e:
-        print(f"❌ Database initialization error: {e}")
-        print(f"Error type: {type(e).__name__}")
+        print(f"❌ Initialization error: {e}")
         import traceback
         traceback.print_exc()
-        print("⚠️  Running in API-only mode (no persistence)")
+        print("⚠️  Running in API-only mode")
     
     print("=" * 50)
+    
+    
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Stop scheduler on shutdown"""
+    print("🛑 Shutting down...")
+    stop_scheduler()
+    print("✅ Shutdown complete")
+    
+    
+# ============ SCHEDULER ENDPOINTS ============
 
+@app.get("/api/scheduler/status")
+async def scheduler_status():
+    """Get scheduler status"""
+    return get_scheduler_status()
+
+@app.post("/api/scheduler/trigger")
+async def trigger_fetch_now():
+    """Manually trigger data fetch immediately"""
+    success = trigger_job_now()
+    
+    if success:
+        return {
+            "status": "triggered",
+            "message": "Data fetch job triggered, check logs for progress"
+        }
+    else:
+        raise HTTPException(status_code=503, detail="Scheduler not running")
 # ============ BASIC ENDPOINTS (no database) ============
 
 @app.get("/")
@@ -277,3 +317,151 @@ def health_check():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    
+@app.get("/api/aircraft/viewport")
+async def aircraft_in_viewport(
+    min_lon: float,
+    min_lat: float,
+    max_lon: float,
+    max_lat: float,
+    limit: int = 1000
+):
+    """
+    Get aircraft in map viewport (bounding box)
+    
+    Example: /api/aircraft/viewport?min_lon=-10&min_lat=35&max_lon=20&max_lat=55
+    """
+    try:
+        from database import get_db
+        db = next(get_db())
+        
+        try:
+            aircraft = get_aircraft_in_viewport(
+                db, min_lon, min_lat, max_lon, max_lat, limit
+            )
+            
+            return {
+                "type": "FeatureCollection",
+                "features": aircraft,
+                "count": len(aircraft),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        finally:
+            db.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/aircraft/near")
+async def aircraft_near_point(
+    lon: float,
+    lat: float,
+    radius_km: float = 50,
+    limit: int = 100
+):
+    """
+    Get aircraft within radius of a point
+    
+    Example: /api/aircraft/near?lon=12.5&lat=41.9&radius_km=100
+    """
+    try:
+        from database import get_db
+        db = next(get_db())
+        
+        try:
+            aircraft = get_aircraft_near_point(db, lon, lat, radius_km, limit)
+            
+            return {
+                "center": {"lon": lon, "lat": lat},
+                "radius_km": radius_km,
+                "aircraft": aircraft,
+                "count": len(aircraft),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        finally:
+            db.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/aircraft/{icao24}/trajectory")
+async def aircraft_trajectory(icao24: str, hours: int = 24):
+    """
+    Get aircraft movement trajectory
+    
+    Example: /api/aircraft/abc123/trajectory?hours=6
+    """
+    try:
+        from database import get_db
+        db = next(get_db())
+        
+        try:
+            trajectory = get_aircraft_trajectory(db, icao24, hours)
+            
+            if trajectory is None:
+                raise HTTPException(status_code=404, detail="Aircraft not found or no trajectory data")
+            
+            return trajectory
+        finally:
+            db.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/heatmap/density")
+async def density_heatmap(resolution: int = 7, min_count: int = 5):
+    """
+    Get aircraft density heatmap by H3 hexagons
+    
+    Example: /api/heatmap/density?resolution=7&min_count=10
+    """
+    try:
+        from database import get_db
+        db = next(get_db())
+        
+        try:
+            heatmap = get_density_heatmap(db, resolution, min_count)
+            
+            return {
+                "h3_resolution": resolution,
+                "cells": heatmap,
+                "count": len(heatmap),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        finally:
+            db.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/stats/spatial")
+async def spatial_statistics():
+    """Get comprehensive spatial statistics"""
+    try:
+        from database import get_db
+        db = next(get_db())
+        
+        try:
+            stats = get_spatial_stats(db)
+            return stats
+        finally:
+            db.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/analytics/routes")
+async def busiest_routes(limit: int = 20):
+    """Get busiest flight routes/airlines"""
+    try:
+        from database import get_db
+        db = next(get_db())
+        
+        try:
+            routes = get_busiest_routes(db, limit)
+            return {
+                "routes": routes,
+                "count": len(routes),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        finally:
+            db.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

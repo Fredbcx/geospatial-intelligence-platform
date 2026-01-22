@@ -2,7 +2,7 @@ from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, Foreig
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from geoalchemy2 import Geography
-from datetime import datetime
+from datetime import datetime, timezone  
 
 Base = declarative_base()
 
@@ -15,16 +15,15 @@ class Aircraft(Base):
     callsign = Column(String(50))
     aircraft_type = Column(String(100))
     origin_country = Column(String(100))
-    last_position = Column(Geography('POINT', srid=4326))  # PostGIS geography type
+    last_position = Column(Geography('POINT', srid=4326))
     last_update = Column(DateTime(timezone=True))
     altitude_meters = Column(Float)
     velocity_mps = Column(Float)
     heading = Column(Float)
     vertical_rate = Column(Float)
     on_ground = Column(Boolean)
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # FIX
     
-    # Relationship to position history
     positions = relationship("AircraftPosition", back_populates="aircraft", cascade="all, delete-orphan")
     
     def __repr__(self):
@@ -42,9 +41,8 @@ class AircraftPosition(Base):
     velocity_mps = Column(Float)
     heading = Column(Float)
     h3_cell_id = Column(String(20), index=True)
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # FIX
     
-    # Relationship to aircraft
     aircraft = relationship("Aircraft", back_populates="positions")
     
     def __repr__(self):
@@ -64,7 +62,7 @@ class Vessel(Base):
     speed_knots = Column(Float)
     heading = Column(Float)
     destination = Column(String(255))
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # FIX
     
     positions = relationship("VesselPosition", back_populates="vessel", cascade="all, delete-orphan")
     
@@ -82,7 +80,7 @@ class VesselPosition(Base):
     speed_knots = Column(Float)
     heading = Column(Float)
     h3_cell_id = Column(String(20), index=True)
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # FIX
     
     vessel = relationship("Vessel", back_populates="positions")
 
@@ -99,9 +97,9 @@ class Event(Base):
     severity = Column(String(50))
     source = Column(String(100))
     source_url = Column(Text)
-    event_metadata = Column("metadata", JSON)  # JSONB for flexible data
+    event_metadata = Column("metadata", JSON)
     h3_cell_id = Column(String(20), index=True)
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # FIX
     
     def __repr__(self):
         return f"<Event {self.event_type} - {self.title}>"

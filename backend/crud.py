@@ -1,8 +1,8 @@
 from sqlalchemy.orm import Session
 from geoalchemy2.functions import ST_Point, ST_Distance, ST_DWithin
 from geoalchemy2.elements import WKTElement
-import h3
-from datetime import datetime
+import h3  
+from datetime import datetime, timezone
 from typing import List, Optional
 from models import Aircraft, AircraftPosition, Vessel, VesselPosition, Event
 
@@ -56,14 +56,16 @@ def create_aircraft_position(db: Session, aircraft_id: int, data: dict) -> Aircr
     """
     lon, lat = data['longitude'], data['latitude']
     
-    # Calculate H3 cell (resolution 7 ≈ 5km hexagons)
-    h3_cell = h3.geo_to_h3(lat, lon, resolution=7)
+    try:
+        h3_cell = h3.latlng_to_cell(lat, lon, res=7)
+    except AttributeError:
+        h3_cell = h3.geo_to_h3(lat, lon, resolution=7)
     
     point = f"POINT({lon} {lat})"
     position = AircraftPosition(
         aircraft_id=aircraft_id,
         position=WKTElement(point, srid=4326),
-        timestamp=data.get('timestamp', datetime.utcnow()),
+        timestamp=data.get('timestamp', datetime.now(timezone.utc)),
         altitude_meters=data.get('altitude'),
         velocity_mps=data.get('velocity'),
         heading=data.get('heading'),
