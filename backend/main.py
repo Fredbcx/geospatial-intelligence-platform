@@ -1,3 +1,5 @@
+from database import get_db
+import crud
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -12,11 +14,13 @@ from scheduler import start_scheduler, stop_scheduler, get_scheduler_status, tri
 from spatial_queries import (
     get_aircraft_in_viewport,
     get_aircraft_near_point,
-    get_aircraft_trajectory,
     get_density_heatmap,
     get_spatial_stats,
     get_busiest_routes
 )
+import logging
+
+logger = logging.getLogger(__name__) 
 
 
 load_dotenv()
@@ -69,9 +73,9 @@ async def startup_event():
             print("✅ Database initialized successfully")
             
             # START SCHEDULER - NUOVO!
-            print("🔄 Starting background scheduler...")
-            start_scheduler(interval_minutes=5)  # Fetch every 5 minutes
-            print("✅ Scheduler started successfully")
+            #print("🔄 Starting background scheduler...")
+            #start_scheduler(interval_minutes=5)  # Fetch every 5 minutes
+            #print("✅ Scheduler started successfully")
             
         else:
             print("⚠️  Database connection failed - running in API-only mode")
@@ -382,30 +386,75 @@ async def aircraft_near_point(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/api/aircraft/{icao24}/trajectory")
-async def aircraft_trajectory(icao24: str, hours: int = 24):
-    """
-    Get aircraft movement trajectory
+async def get_trajectory_endpoint(
+    icao24: str,
+    hours: int = 1
+):
+    """Get trajectory (historical path) for specific aircraft"""
+    from datetime import timedelta
+    from database import get_db
+    from geoalchemy2.shape import to_shape 
     
-    Example: /api/aircraft/abc123/trajectory?hours=6
-    """
+    db = next(get_db())
+    
     try:
-        from database import get_db
-        db = next(get_db())
+        # Get aircraft
+        aircraft = crud.get_aircraft_by_icao24(db, icao24)
+        if not aircraft:
+            raise HTTPException(status_code=404, detail="Aircraft not found")
         
-        try:
-            trajectory = get_aircraft_trajectory(db, icao24, hours)
-            
-            if trajectory is None:
-                raise HTTPException(status_code=404, detail="Aircraft not found or no trajectory data")
-            
-            return trajectory
-        finally:
-            db.close()
+        # Get positions from last N hours
+        since = datetime.now(timezone.utc) - timedelta(hours=hours)
+        positions = crud.get_aircraft_positions_since(db, aircraft.id, since)
+        
+        if not positions:
+            return {
+                "type": "Feature",
+                "properties": {
+                    "icao24": icao24,
+                    "callsign": aircraft.callsign,
+                    "count": 0
+                },
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": []
+                }
+            }
+        
+        # ✅ Extract coordinates from Geography POINT field
+        coordinates = []
+        for pos in positions:
+            if pos.position:  # Geography field
+                point = to_shape(pos.position)
+                # point.x = longitude, point.y = latitude
+                altitude = pos.altitude_meters if pos.altitude_meters else 0
+                coordinates.append([point.x, point.y, altitude])
+        
+        return {
+            "type": "Feature",
+            "properties": {
+                "icao24": icao24,
+                "callsign": aircraft.callsign,
+                "origin_country": aircraft.origin_country,
+                "count": len(coordinates)
+            },
+            "geometry": {
+                "type": "LineString",
+                "coordinates": coordinates
+            }
+        }
+        
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Error getting trajectory: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
 
 @app.get("/api/heatmap/density")
 async def density_heatmap(resolution: int = 7, min_count: int = 5):

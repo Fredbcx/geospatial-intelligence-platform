@@ -6,7 +6,6 @@ from models import Base
 
 load_dotenv()
 
-# IMPORTANTE: usa localhost invece di 127.0.0.1 (funziona meglio su più piattaforme)
 DATABASE_URL = os.getenv(
     "DATABASE_URL", 
     "postgresql+psycopg://geoint:password@localhost:5432/geoint"
@@ -17,7 +16,7 @@ print(f"🔗 Connecting to: {DATABASE_URL.replace('password', '***')}")
 engine = create_engine(
     DATABASE_URL, 
     pool_pre_ping=True,
-    echo=False,  # Cambia a True per debug SQL
+    echo=False, 
     pool_size=5,
     max_overflow=10
 )

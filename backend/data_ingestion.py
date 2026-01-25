@@ -4,7 +4,7 @@ Runs scheduled jobs in background
 """
 
 import requests
-import asyncio
+import time
 from datetime import datetime, timezone  
 from typing import Optional, Dict, List
 from sqlalchemy.orm import Session
@@ -35,39 +35,55 @@ class OpenSkyFetcher:
         self.last_fetch_time = None
         self.fetch_count = 0
     
-    def fetch_aircraft_data(self) -> Optional[Dict]:
+    def fetch_aircraft_data(self, max_retries: int = 3) -> Optional[Dict]:
         """
-        Fetch current aircraft states from OpenSky
+        Fetch current aircraft states from OpenSky with retry logic
         Returns raw API response or None if error
         """
-        try:
-            logger.info("Fetching aircraft data from OpenSky Network...")
-            
-            response = requests.get(
-                self.BASE_URL,
-                auth=self.auth,
-                timeout=15
-            )
-            response.raise_for_status()
-            
-            data = response.json()
-            self.last_fetch_time = datetime.now(timezone.utc)  # FIX
-            self.fetch_count += 1
-            
-            total_states = len(data.get('states', []))
-            logger.info(f"✅ Fetched {total_states} aircraft states")
-            
-            return data
-            
-        except requests.exceptions.Timeout:
-            logger.error("❌ OpenSky API timeout")
-            return None
-        except requests.exceptions.RequestException as e:
-            logger.error(f"❌ OpenSky API error: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"❌ Unexpected error fetching data: {e}")
-            return None
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Fetching aircraft data from OpenSky Network... (attempt {attempt + 1}/{max_retries})")
+                
+                response = requests.get(
+                    self.BASE_URL,
+                    auth=self.auth,
+                    timeout=45  
+                )
+                response.raise_for_status()
+                
+                data = response.json()
+                self.last_fetch_time = datetime.now(timezone.utc)
+                self.fetch_count += 1
+                
+                total_states = len(data.get('states', []))
+                logger.info(f"✅ Fetched {total_states} aircraft states")
+                
+                return data
+                
+            except requests.exceptions.Timeout:
+                logger.warning(f"⚠️  OpenSky API timeout (attempt {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    wait_time = 5 * (attempt + 1)  # Exponential backoff: 5s, 10s, 15s
+                    logger.info(f"Waiting {wait_time}s before retry...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error("❌ All retry attempts exhausted - OpenSky API timeout")
+                    return None
+                    
+            except requests.exceptions.RequestException as e:
+                logger.error(f"❌ OpenSky API error: {e}")
+                if attempt < max_retries - 1:
+                    logger.info("Retrying after 5s...")
+                    time.sleep(5)
+                    continue
+                return None
+                
+            except Exception as e:
+                logger.error(f"❌ Unexpected error fetching data: {e}")
+                return None
+        
+        return None
     
     def parse_aircraft_state(self, state: List) -> Optional[Dict]:
         """
@@ -146,7 +162,7 @@ class OpenSkyFetcher:
             'stored_positions': stored_positions,
             'skipped': skipped,
             'errors': errors,
-            'timestamp': datetime.now(timezone.utc).isoformat()  # FIX
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }
         
         logger.info(

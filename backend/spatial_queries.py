@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text, func
 from geoalchemy2.functions import ST_AsGeoJSON, ST_MakeLine, ST_Transform
 from geoalchemy2.elements import WKTElement
-from datetime import datetime, timedelta, timezone  # AGGIUNTO timezone qui
+from datetime import datetime, timedelta, timezone  
 from typing import List, Dict, Optional, Tuple
 import json
 

@@ -5,6 +5,8 @@ import h3
 from datetime import datetime, timezone
 from typing import List, Optional
 from models import Aircraft, AircraftPosition, Vessel, VesselPosition, Event
+from geoalchemy2.shape import from_shape, to_shape
+from shapely.geometry import Point
 
 # ============= AIRCRAFT OPERATIONS =============
 
@@ -54,17 +56,23 @@ def create_aircraft_position(db: Session, aircraft_id: int, data: dict) -> Aircr
     Record aircraft position in history
     Calculates H3 cell ID for spatial indexing
     """
+    from geoalchemy2.shape import from_shape
+    from shapely.geometry import Point
+    
     lon, lat = data['longitude'], data['latitude']
     
+    # Calculate H3 cell
     try:
         h3_cell = h3.latlng_to_cell(lat, lon, res=7)
     except AttributeError:
         h3_cell = h3.geo_to_h3(lat, lon, resolution=7)
     
-    point = f"POINT({lon} {lat})"
+    shapely_point = Point(lon, lat)  # Create Shapely Point
+    geog_point = from_shape(shapely_point, srid=4326)  # Convert to Geography
+    
     position = AircraftPosition(
         aircraft_id=aircraft_id,
-        position=WKTElement(point, srid=4326),
+        position=geog_point,  
         timestamp=data.get('timestamp', datetime.now(timezone.utc)),
         altitude_meters=data.get('altitude'),
         velocity_mps=data.get('velocity'),
@@ -75,6 +83,7 @@ def create_aircraft_position(db: Session, aircraft_id: int, data: dict) -> Aircr
     db.add(position)
     db.commit()
     db.refresh(position)
+    
     return position
 
 def get_aircraft_in_bbox(db: Session, min_lon: float, min_lat: float, 
@@ -119,6 +128,24 @@ def get_aircraft_trajectory(db: Session, aircraft_id: int,
     
     return positions
 
+
+
+def get_aircraft_by_icao24(db: Session, icao24: str):
+    """Get aircraft by ICAO24 identifier"""
+    return db.query(Aircraft).filter(Aircraft.icao24 == icao24).first()
+
+def get_aircraft_positions_since(db: Session, aircraft_id: int, since: datetime, limit: int = 1000):
+    """Get aircraft positions since specific time"""
+    return (
+        db.query(AircraftPosition)
+        .filter(
+            AircraftPosition.aircraft_id == aircraft_id,
+            AircraftPosition.timestamp >= since
+        )
+        .order_by(AircraftPosition.timestamp.asc())
+        .limit(limit)
+        .all()
+    )
 # ============= UTILITY FUNCTIONS =============
 
 def get_stats(db: Session) -> dict:
