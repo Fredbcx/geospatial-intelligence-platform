@@ -4,9 +4,11 @@ from geoalchemy2.elements import WKTElement
 import h3  
 from datetime import datetime, timezone
 from typing import List, Optional
-from models import Aircraft, AircraftPosition, Vessel, VesselPosition, Event
+from models import Aircraft, AircraftPosition, Vessel, VesselPosition, Event, Alert  
 from geoalchemy2.shape import from_shape, to_shape
 from shapely.geometry import Point
+from models import Alert 
+from anomaly_detection import AnomalyDetector
 
 # ============= AIRCRAFT OPERATIONS =============
 
@@ -160,4 +162,212 @@ def get_stats(db: Session) -> dict:
         "total_vessels": total_vessels,
         "total_events": total_events,
         "total_aircraft_positions": total_aircraft_positions
+    }
+    
+    
+# ============= ALERT CRUD OPERATIONS =============
+
+def create_alert(db: Session, alert_data: dict):
+    """Create new alert in database"""
+    point = f"POINT({alert_data['longitude']} {alert_data['latitude']})"
+    priority = calculate_alert_priority(alert_data)
+    
+    alert = Alert(
+        alert_type=alert_data['type'],
+        severity=alert_data['severity'],
+        reason=alert_data['reason'],
+        aircraft_icao24=alert_data['aircraft_icao24'],
+        aircraft_callsign=alert_data['aircraft_callsign'],
+        position=WKTElement(point, srid=4326),
+        detected_at=datetime.now(timezone.utc),
+        is_active=True,
+        is_acknowledged=False,
+        details=alert_data.get('details', {}),
+        priority=priority
+    )
+    
+    db.add(alert)
+    db.commit()
+    db.refresh(alert)
+    return alert
+
+def get_active_alerts(db: Session, limit: int = 100):
+    """Get all active alerts"""
+    return (
+        db.query(Alert)
+        .filter(Alert.is_active == True)
+        .order_by(Alert.priority.desc(), Alert.detected_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+def get_alerts_by_severity(db: Session, severity: str, limit: int = 100):
+    """Get alerts by severity level"""
+    return (
+        db.query(Alert)
+        .filter(Alert.severity == severity, Alert.is_active == True)
+        .order_by(Alert.detected_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+def get_alerts_for_aircraft(db: Session, icao24: str, limit: int = 50):
+    """Get all alerts for specific aircraft"""
+    return (
+        db.query(Alert)
+        .filter(Alert.aircraft_icao24 == icao24)
+        .order_by(Alert.detected_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+def acknowledge_alert(db: Session, alert_id: int):
+    """Mark alert as acknowledged"""
+    alert = db.query(Alert).filter(Alert.id == alert_id).first()
+    if alert:
+        alert.is_acknowledged = True
+        db.commit()
+        db.refresh(alert)
+    return alert
+
+def resolve_alert(db: Session, alert_id: int):
+    """Mark alert as resolved"""
+    alert = db.query(Alert).filter(Alert.id == alert_id).first()
+    if alert:
+        alert.is_active = False
+        alert.resolved_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(alert)
+    return alert
+
+def run_anomaly_detection_on_all_aircraft(db: Session):
+    """
+    Run anomaly detection on all aircraft and create alerts
+    Includes intelligent deduplication to avoid duplicate alerts
+    
+    Returns:
+        list[Alert]: List of newly created alerts (excludes updated existing ones)
+    """
+    # ============= STEP 1: Get all aircraft with positions =============
+    aircraft = db.query(Aircraft).filter(Aircraft.last_position.isnot(None)).all()
+    
+    if not aircraft:
+        return []
+    
+    # ============= STEP 2: Prepare data for detector =============
+    aircraft_data = []
+    for a in aircraft:
+        if a.last_position:
+            # Extract lat/lon from Geography field
+            point = to_shape(a.last_position)
+            
+            aircraft_data.append({
+                'icao24': a.icao24,
+                'callsign': a.callsign,
+                'latitude': point.y,   # point.y = latitude
+                'longitude': point.x,  # point.x = longitude
+                'altitude': a.altitude_meters if a.altitude_meters else 0,
+                'velocity': a.velocity_mps if a.velocity_mps else 0,
+                'vertical_rate': a.vertical_rate if hasattr(a, 'vertical_rate') else 0,
+                'heading': a.heading if a.heading else 0
+            })
+    
+    if not aircraft_data:
+        return []
+    
+    # ============= STEP 3: Run anomaly detection =============
+    detector = AnomalyDetector()
+    detected_anomalies = detector.detect_all(aircraft_data)
+    
+    # ============= STEP 4: Create/update alerts with deduplication =============
+    new_alerts = []
+    updated_count = 0
+    
+    for anomaly in detected_anomalies:
+        # CHECK if alert already exists (same aircraft + same type + still active)
+        existing_alert = db.query(Alert).filter(
+            Alert.aircraft_icao24 == anomaly['icao24'],
+            Alert.alert_type == anomaly['type'],
+            Alert.is_active == True,
+            Alert.is_acknowledged == False
+        ).first()
+        
+        if existing_alert:
+            # UPDATE existing alert timestamp (anomaly still ongoing)
+            existing_alert.detected_at = datetime.now(timezone.utc)
+            # Optionally update position if aircraft moved
+            existing_alert.position = f"POINT({anomaly['longitude']} {anomaly['latitude']})"
+            updated_count += 1
+        else:
+            # CREATE new alert only if doesn't exist
+            alert = Alert(
+                alert_type=anomaly['type'],
+                severity=anomaly['severity'],
+                reason=anomaly['reason'],
+                aircraft_icao24=anomaly['icao24'],
+                aircraft_callsign=anomaly['callsign'],
+                position=f"POINT({anomaly['longitude']} {anomaly['latitude']})",
+                detected_at=datetime.now(timezone.utc),
+                is_active=True,
+                is_acknowledged=False,
+                priority=anomaly['priority'],
+                details=anomaly.get('details', {})
+            )
+            db.add(alert)
+            new_alerts.append(alert)
+    
+    db.commit()
+    
+    # Log summary
+    if new_alerts or updated_count > 0:
+        print(f"   ✅ Created {len(new_alerts)} new alerts, updated {updated_count} existing")
+    
+    return new_alerts
+
+
+# ============= Auto-resolve alerts =============
+
+def auto_resolve_old_alerts(db: Session, max_age_minutes=30):
+    """
+    Automatically resolve alerts that haven't been updated in N minutes
+    (means aircraft left restricted zone or anomaly stopped)
+    
+    Call this periodically or at the end of detection run
+    """
+    from datetime import timedelta
+    
+    cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
+    
+    old_alerts = db.query(Alert).filter(
+        Alert.is_active == True,
+        Alert.detected_at < cutoff_time
+    ).all()
+    
+    for alert in old_alerts:
+        alert.is_active = False
+        alert.resolved_at = datetime.now(timezone.utc)
+    
+    db.commit()
+    
+    if old_alerts:
+        print(f"   🔄 Auto-resolved {len(old_alerts)} old alerts")
+    
+    return len(old_alerts)
+
+  
+def get_alert_statistics(db: Session):
+    """Get alert stats for dashboard"""
+    return {
+        'total_alerts': db.query(Alert).count(),
+        'active_alerts': db.query(Alert).filter(Alert.is_active == True).count(),
+        'by_severity': {
+            'HIGH': db.query(Alert).filter(Alert.severity == 'HIGH', Alert.is_active == True).count(),
+            'MEDIUM': db.query(Alert).filter(Alert.severity == 'MEDIUM', Alert.is_active == True).count(),
+            'LOW': db.query(Alert).filter(Alert.severity == 'LOW', Alert.is_active == True).count()
+        },
+        'by_type': {
+            'SPEED_ANOMALY': db.query(Alert).filter(Alert.alert_type == 'SPEED_ANOMALY', Alert.is_active == True).count(),
+            'ALTITUDE_ANOMALY': db.query(Alert).filter(Alert.alert_type == 'ALTITUDE_ANOMALY', Alert.is_active == True).count(),
+            'GEOFENCE_VIOLATION': db.query(Alert).filter(Alert.alert_type == 'GEOFENCE_VIOLATION', Alert.is_active == True).count(),
+        }
     }

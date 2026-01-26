@@ -1,9 +1,10 @@
 """
-Populate database with fake aircraft data INCLUDING historical positions
-This creates realistic trajectories for testing
+Populate database with fake aircraft data INCLUDING realistic trajectories
+Uses great circle paths between European airports for realism
 """
 
 import random
+import math
 from datetime import datetime, timezone, timedelta
 from database import SessionLocal
 import crud
@@ -12,114 +13,258 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def generate_realistic_trajectory(start_lat, start_lon, steps=30):
+# Major European airports as waypoints
+EUROPEAN_AIRPORTS = [
+    # Italy
+    {"name": "Rome FCO", "lat": 41.8003, "lon": 12.2389, "city": "Rome"},
+    {"name": "Milan MXP", "lat": 45.6306, "lon": 8.7281, "city": "Milan"},
+    {"name": "Venice VCE", "lat": 45.5053, "lon": 12.3519, "city": "Venice"},
+    # France
+    {"name": "Paris CDG", "lat": 49.0097, "lon": 2.5479, "city": "Paris"},
+    {"name": "Nice NCE", "lat": 43.6584, "lon": 7.2159, "city": "Nice"},
+    {"name": "Lyon LYS", "lat": 45.7256, "lon": 5.0811, "city": "Lyon"},
+    # Germany
+    {"name": "Frankfurt FRA", "lat": 50.0379, "lon": 8.5622, "city": "Frankfurt"},
+    {"name": "Munich MUC", "lat": 48.3538, "lon": 11.7861, "city": "Munich"},
+    {"name": "Berlin BER", "lat": 52.3667, "lon": 13.5033, "city": "Berlin"},
+    # Spain
+    {"name": "Madrid MAD", "lat": 40.4719, "lon": -3.5626, "city": "Madrid"},
+    {"name": "Barcelona BCN", "lat": 41.2974, "lon": 2.0833, "city": "Barcelona"},
+    # UK
+    {"name": "London LHR", "lat": 51.4700, "lon": -0.4543, "city": "London"},
+    {"name": "Manchester MAN", "lat": 53.3537, "lon": -2.2750, "city": "Manchester"},
+    # Netherlands
+    {"name": "Amsterdam AMS", "lat": 52.3105, "lon": 4.7683, "city": "Amsterdam"},
+    # Switzerland
+    {"name": "Zurich ZRH", "lat": 47.4647, "lon": 8.5492, "city": "Zurich"},
+    # Austria
+    {"name": "Vienna VIE", "lat": 48.1103, "lon": 16.5697, "city": "Vienna"},
+]
+
+def haversine_distance(lat1, lon1, lat2, lon2):
     """
-    Generate a realistic flight path
+    Calculate distance between two points on Earth using Haversine formula
+    Returns distance in kilometers
+    """
+    R = 6371  # Earth radius in km
     
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    delta_lat = math.radians(lat2 - lat1)
+    delta_lon = math.radians(lon2 - lon1)
+    
+    a = math.sin(delta_lat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    
+    return R * c
+
+def calculate_bearing(lat1, lon1, lat2, lon2):
+    """
+    Calculate initial bearing (heading) from point 1 to point 2
+    Returns bearing in degrees (0-360)
+    """
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    delta_lon = math.radians(lon2 - lon1)
+    
+    x = math.sin(delta_lon) * math.cos(lat2_rad)
+    y = math.cos(lat1_rad) * math.sin(lat2_rad) - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(delta_lon)
+    
+    bearing = math.degrees(math.atan2(x, y))
+    return (bearing + 360) % 360
+
+def interpolate_great_circle(lat1, lon1, lat2, lon2, fraction):
+    """
+    Interpolate a point along great circle path
+    fraction: 0.0 (start) to 1.0 (end)
+    Returns (lat, lon) of interpolated point
+    """
+    # Convert to radians
+    lat1_rad = math.radians(lat1)
+    lon1_rad = math.radians(lon1)
+    lat2_rad = math.radians(lat2)
+    lon2_rad = math.radians(lon2)
+    
+    # Calculate angular distance
+    delta_lat = lat2_rad - lat1_rad
+    delta_lon = lon2_rad - lon1_rad
+    a = math.sin(delta_lat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon/2)**2
+    angular_distance = 2 * math.asin(math.sqrt(a))
+    
+    # Handle same points
+    if angular_distance < 1e-6:
+        return lat1, lon1
+    
+    # Slerp interpolation
+    a_val = math.sin((1 - fraction) * angular_distance) / math.sin(angular_distance)
+    b_val = math.sin(fraction * angular_distance) / math.sin(angular_distance)
+    
+    x = a_val * math.cos(lat1_rad) * math.cos(lon1_rad) + b_val * math.cos(lat2_rad) * math.cos(lon2_rad)
+    y = a_val * math.cos(lat1_rad) * math.sin(lon1_rad) + b_val * math.cos(lat2_rad) * math.sin(lon2_rad)
+    z = a_val * math.sin(lat1_rad) + b_val * math.sin(lat2_rad)
+    
+    lat_interp = math.atan2(z, math.sqrt(x**2 + y**2))
+    lon_interp = math.atan2(y, x)
+    
+    return math.degrees(lat_interp), math.degrees(lon_interp)
+
+def generate_altitude_profile(distance_km, num_points):
+    """
+    Generate realistic altitude profile for flight
+    
+    Returns list of altitudes in meters
+    - Takeoff: climb from 0 to cruise altitude
+    - Cruise: maintain altitude
+    - Landing: descend to 0
+    """
+    altitudes = []
+    
+    # Determine cruise altitude based on distance
+    if distance_km < 500:
+        cruise_altitude = random.uniform(8000, 10000)  # Short flights
+    elif distance_km < 1500:
+        cruise_altitude = random.uniform(9000, 11000)  # Medium flights
+    else:
+        cruise_altitude = random.uniform(10000, 12000)  # Long flights
+    
+    # Calculate phases
+    climb_points = int(num_points * 0.2)  # 20% climbing
+    descent_points = int(num_points * 0.2)  # 20% descending
+    cruise_points = num_points - climb_points - descent_points  # 60% cruising
+    
+    # Climb phase (0 → cruise altitude)
+    for i in range(climb_points):
+        fraction = i / climb_points
+        # Exponential climb (faster at start, levels off)
+        altitude = cruise_altitude * (1 - math.exp(-3 * fraction))
+        altitudes.append(altitude + random.uniform(-100, 100))
+    
+    # Cruise phase (maintain altitude)
+    for i in range(cruise_points):
+        altitude = cruise_altitude + random.uniform(-200, 200)
+        altitudes.append(altitude)
+    
+    # Descent phase (cruise altitude → 0)
+    for i in range(descent_points):
+        fraction = i / descent_points
+        # Exponential descent
+        altitude = cruise_altitude * (1 - fraction) ** 2
+        altitudes.append(altitude + random.uniform(-100, 100))
+    
+    return altitudes
+
+def generate_realistic_flight_trajectory(origin_airport, dest_airport, steps=30):
+    """
+    Generate realistic flight path using great circle route
+    
+    Args:
+        origin_airport: dict with lat, lon, name
+        dest_airport: dict with lat, lon, name
+        steps: number of position points
+        
     Returns list of position dicts with all required fields
     """
     trajectory = []
     
-    # Random direction (heading)
-    heading = random.uniform(0, 360)
+    start_lat = origin_airport["lat"]
+    start_lon = origin_airport["lon"]
+    end_lat = dest_airport["lat"]
+    end_lon = dest_airport["lon"]
     
-    # Speed (km/h to degrees per minute)
-    speed_kmh = random.uniform(400, 900)
-    speed_deg_per_min = speed_kmh / 111  # Rough approximation
+    # Calculate total distance
+    distance_km = haversine_distance(start_lat, start_lon, end_lat, end_lon)
     
-    # Starting altitude
-    altitude = random.uniform(8000, 12000)
+    # Generate altitude profile
+    altitudes = generate_altitude_profile(distance_km, steps)
     
-    current_lat = start_lat
-    current_lon = start_lon
+    # Calculate flight time (based on average speed ~800 km/h)
+    avg_speed_kmh = 800
+    total_time_hours = distance_km / avg_speed_kmh
+    time_per_step = total_time_hours * 60 / steps  # minutes per step
+    
+    # Starting time (1 hour ago)
     current_time = datetime.now(timezone.utc) - timedelta(hours=1)
     
     for i in range(steps):
-        # Small random variations in heading
-        heading += random.uniform(-5, 5)
-        heading = heading % 360  # Keep in 0-360 range
+        fraction = i / (steps - 1) if steps > 1 else 0
         
-        # Move aircraft (convert heading to movement)
-        import math
-        heading_rad = math.radians(heading)
-        lat_change = speed_deg_per_min * 2 * math.cos(heading_rad) * random.uniform(0.8, 1.2)
-        lon_change = speed_deg_per_min * 2 * math.sin(heading_rad) * random.uniform(0.8, 1.2)
+        # Interpolate position along great circle
+        lat, lon = interpolate_great_circle(start_lat, start_lon, end_lat, end_lon, fraction)
         
-        current_lat += lat_change
-        current_lon += lon_change
+        # Calculate heading (bearing to next point)
+        if i < steps - 1:
+            next_fraction = (i + 1) / (steps - 1)
+            next_lat, next_lon = interpolate_great_circle(start_lat, start_lon, end_lat, end_lon, next_fraction)
+            heading = calculate_bearing(lat, lon, next_lat, next_lon)
+        else:
+            # Last point uses previous heading
+            heading = calculate_bearing(
+                trajectory[-1]['latitude'],
+                trajectory[-1]['longitude'],
+                lat, lon
+            ) if trajectory else 0
         
-        # ✅ Bounce at bounds instead of clamping
-        if current_lat > 60:
-            current_lat = 60 - (current_lat - 60)
-            heading = 360 - heading  # Reverse direction
-        elif current_lat < 35:
-            current_lat = 35 + (35 - current_lat)
-            heading = 360 - heading
-            
-        if current_lon > 30:
-            current_lon = 30 - (current_lon - 30)
-            heading = 180 - heading
-        elif current_lon < -10:
-            current_lon = -10 + (-10 - current_lon)
-            heading = 180 - heading
+        # Get altitude from profile
+        altitude = altitudes[i]
         
-        # Small altitude variations
-        altitude += random.uniform(-200, 200)
-        altitude = max(5000, min(12000, altitude))
+        # Calculate realistic speed based on altitude
+        # Lower altitude = slower speed (takeoff/landing)
+        # Higher altitude = faster speed (cruise)
+        altitude_factor = min(1.0, altitude / 10000)  # Normalize by cruise altitude
+        speed_kmh = 400 + (400 * altitude_factor)  # 400-800 km/h range
+        speed_mps = speed_kmh / 3.6
         
-        # Time progression (2 minutes between points)
-        current_time += timedelta(minutes=2)
+        # Vertical rate (m/s) - positive climbing, negative descending
+        if i > 0:
+            altitude_change = altitude - altitudes[i-1]
+            time_delta_seconds = time_per_step * 60
+            vertical_rate = altitude_change / time_delta_seconds if time_delta_seconds > 0 else 0
+        else:
+            vertical_rate = 0
+        
+        # On ground only at start/end if altitude is very low
+        on_ground = altitude < 100
+        
+        # Time progression
+        current_time += timedelta(minutes=time_per_step)
         
         trajectory.append({
-            'latitude': current_lat,
-            'longitude': current_lon,  # ✅ CRITICAL: Must include longitude!
-            'altitude': altitude,
+            'latitude': lat,
+            'longitude': lon,
+            'altitude': max(0, altitude),  # Never negative
             'timestamp': current_time,
-            'velocity': speed_kmh / 3.6,  # Convert to m/s
+            'velocity': speed_mps,
             'heading': heading,
-            'vertical_rate': random.uniform(-2, 2),
-            'on_ground': False
+            'vertical_rate': vertical_rate,
+            'on_ground': on_ground
         })
     
     return trajectory
 
 def generate_test_aircraft_with_trajectories(count=100):
-    """Generate fake aircraft with realistic trajectories"""
+    """Generate fake aircraft with realistic great circle trajectories"""
     aircraft_list = []
     
-    # Europa bounds
-    regions = [
-        # Italia
-        {"min_lat": 36.0, "max_lat": 47.0, "min_lon": 6.0, "max_lon": 19.0, "weight": 0.3},
-        # Francia
-        {"min_lat": 42.0, "max_lat": 51.0, "min_lon": -5.0, "max_lon": 8.0, "weight": 0.2},
-        # Germania
-        {"min_lat": 47.0, "max_lat": 55.0, "min_lon": 6.0, "max_lon": 15.0, "weight": 0.2},
-        # Spagna
-        {"min_lat": 36.0, "max_lat": 44.0, "min_lon": -9.0, "max_lon": 3.0, "weight": 0.15},
-        # UK
-        {"min_lat": 50.0, "max_lat": 59.0, "min_lon": -8.0, "max_lon": 2.0, "weight": 0.15},
-    ]
-    
-    countries = ["Italy", "France", "Germany", "Spain", "United Kingdom"]
-    airlines = ["AZA", "AFR", "DLH", "IBE", "BAW", "RYR", "EZY"]
+    countries = ["Italy", "France", "Germany", "Spain", "United Kingdom", 
+                 "Netherlands", "Switzerland", "Austria"]
+    airlines = ["AZA", "AFR", "DLH", "IBE", "BAW", "RYR", "EZY", "SWR", "AUA"]
     
     for i in range(count):
-        region = random.choices(regions, weights=[r["weight"] for r in regions])[0]
+        # Pick random origin and destination airports (different)
+        origin = random.choice(EUROPEAN_AIRPORTS)
+        dest = random.choice([a for a in EUROPEAN_AIRPORTS if a != origin])
         
-        # Starting position
-        start_lat = random.uniform(region["min_lat"], region["max_lat"])
-        start_lon = random.uniform(region["min_lon"], region["max_lon"])
-        
-        # Generate trajectory (30 points over 1 hour)
-        trajectory = generate_realistic_trajectory(start_lat, start_lon, steps=30)
+        # Generate realistic trajectory between airports
+        trajectory = generate_realistic_flight_trajectory(origin, dest, steps=30)
         
         aircraft_data = {
             'icao24': f"{random.randint(0, 0xffffff):06x}",
             'callsign': f"{random.choice(airlines)}{random.randint(100, 9999)}",
             'origin_country': random.choice(countries),
             'on_ground': False,
-            'trajectory': trajectory
+            'trajectory': trajectory,
+            'origin': origin['name'],
+            'destination': dest['name']
         }
         
         aircraft_list.append(aircraft_data)
@@ -128,7 +273,7 @@ def generate_test_aircraft_with_trajectories(count=100):
 
 def populate_database_with_trajectories(count=100):
     """Populate database with aircraft + their trajectories"""
-    logger.info(f"🛫 Generating {count} aircraft with trajectories...")
+    logger.info(f"✈️ Generating {count} aircraft with GREAT CIRCLE trajectories...")
     aircraft_list = generate_test_aircraft_with_trajectories(count)
     
     db = SessionLocal()
@@ -139,8 +284,13 @@ def populate_database_with_trajectories(count=100):
         
         for aircraft_data in aircraft_list:
             try:
-                # Get latest position for aircraft creation
-                latest = aircraft_data['trajectory'][-1]
+                # Use CURRENT position (random point in trajectory, not landing!)
+                # This gives variety in altitudes instead of all aircraft landed
+                trajectory_length = len(aircraft_data['trajectory'])
+                current_position_idx = random.randint(0, trajectory_length - 1)
+                current = aircraft_data['trajectory'][current_position_idx]
+                
+                logger.info(f"  ✈️  {aircraft_data['callsign']}: {aircraft_data['origin']} → {aircraft_data['destination']} (alt: {current['altitude']:.0f}m)")
                 
                 # Get/create aircraft with complete data
                 aircraft = crud.get_or_create_aircraft(
@@ -149,25 +299,24 @@ def populate_database_with_trajectories(count=100):
                     {
                         'callsign': aircraft_data['callsign'],
                         'origin_country': aircraft_data['origin_country'],
-                        'on_ground': False,
-                        'latitude': latest['latitude'],
-                        'longitude': latest['longitude'],
-                        'altitude': latest['altitude'],
-                        'velocity': latest['velocity'],
-                        'heading': latest['heading'],
-                        'vertical_rate': latest.get('vertical_rate', 0),
-                        'last_update': latest['timestamp'],
-                        'timestamp': latest['timestamp']
+                        'on_ground': current['on_ground'],
+                        'latitude': current['latitude'],
+                        'longitude': current['longitude'],
+                        'altitude': current['altitude'],
+                        'velocity': current['velocity'],
+                        'heading': current['heading'],
+                        'vertical_rate': current.get('vertical_rate', 0),
+                        'last_update': current['timestamp'],
+                        'timestamp': current['timestamp']
                     }
                 )
                 stored_aircraft += 1
                 
                 # Store all trajectory points
                 for point in aircraft_data['trajectory']:
-                    # Include ALL required fields
                     position_data = {
                         'latitude': point['latitude'],
-                        'longitude': point['longitude'],  # ✅ WAS MISSING!
+                        'longitude': point['longitude'],
                         'altitude': point['altitude'],
                         'velocity': point['velocity'],
                         'heading': point['heading'],
@@ -179,14 +328,7 @@ def populate_database_with_trajectories(count=100):
                     crud.create_aircraft_position(db, aircraft.id, position_data)
                     stored_positions += 1
                 
-                # Update aircraft with latest position
-                latest = aircraft_data['trajectory'][-1]
-                aircraft.latitude = latest['latitude']
-                aircraft.longitude = latest['longitude']
-                aircraft.altitude_meters = latest['altitude']
-                aircraft.velocity_mps = latest['velocity']
-                aircraft.heading = latest['heading']
-                aircraft.last_update = latest['timestamp']
+                # Aircraft already has current position from above, just commit
                 db.commit()
                 
             except Exception as e:
@@ -229,7 +371,7 @@ def populate_database_with_trajectories(count=100):
 
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("🧪 POPULATING DATABASE WITH TRAJECTORY DATA")
+    logger.info("🧪 POPULATING DATABASE WITH GREAT CIRCLE TRAJECTORY DATA")
     logger.info("=" * 60)
     
     # Generate 100 aircraft with 30 points each = 3,000 positions
@@ -238,6 +380,7 @@ if __name__ == "__main__":
     if result:
         logger.info("✅ Trajectory data population completed!")
         logger.info(f"   You now have {result['stored_aircraft']} aircraft")
+        logger.info(f"   Flying realistic routes between European airports")
         logger.info(f"   Each with ~30 historical positions")
         logger.info(f"   Total positions: {result['stored_positions']}")
     else:

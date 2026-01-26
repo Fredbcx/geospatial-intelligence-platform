@@ -103,3 +103,27 @@ class Event(Base):
     
     def __repr__(self):
         return f"<Event {self.event_type} - {self.title}>"
+        
+        
+class Alert(Base):
+    """Anomaly alerts detected by the system"""
+    __tablename__ = 'alerts'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    alert_type = Column(String(100), nullable=False, index=True)
+    severity = Column(String(20), nullable=False, index=True)
+    reason = Column(Text, nullable=False)
+    aircraft_icao24 = Column(String(20), index=True)
+    aircraft_callsign = Column(String(50))
+    aircraft_id = Column(Integer, ForeignKey('aircraft.id', ondelete='SET NULL'), nullable=True)
+    position = Column(Geography('POINT', srid=4326), nullable=False)
+    detected_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    is_active = Column(Boolean, default=True, index=True)
+    is_acknowledged = Column(Boolean, default=False)
+    details = Column(JSON)
+    priority = Column(Integer, default=50)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    
+    def __repr__(self):
+        return f"<Alert {self.alert_type} - {self.severity} - {self.aircraft_callsign}>"

@@ -1,4 +1,4 @@
-from database import get_db
+from database import get_db, SessionLocal 
 import crud
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,9 +7,11 @@ from typing import List, Optional
 from sqlalchemy.orm import Session
 from geoalchemy2.shape import to_shape
 import requests
-from datetime import datetime, timezone  
+from datetime import datetime, timezone, timedelta
 import os
 from dotenv import load_dotenv
+from contextlib import asynccontextmanager 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler  
 from scheduler import start_scheduler, stop_scheduler, get_scheduler_status, trigger_job_now
 from spatial_queries import (
     get_aircraft_in_viewport,
@@ -19,42 +21,45 @@ from spatial_queries import (
     get_busiest_routes
 )
 import logging
+from geoalchemy2.shape import to_shape
+from models import Alert
 
-logger = logging.getLogger(__name__) 
-
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-app = FastAPI(
-    title="Geospatial Intelligence Platform API",
-    description="Real-time tracking and analysis of global assets",
-    version="0.2.0"
-)
+# ============= CREATE SCHEDULER (BEFORE FastAPI app) =============
+scheduler = AsyncIOScheduler()  
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ============= BACKGROUND JOBS =============
 
-# Pydantic models
-class AircraftPosition(BaseModel):
-    icao24: str
-    callsign: Optional[str]
-    origin_country: str
-    longitude: float
-    latitude: float
-    altitude: Optional[float]
-    velocity: Optional[float]
-    heading: Optional[float]
-    on_ground: bool
-    last_update: datetime
+def run_periodic_anomaly_detection():
+    """Run anomaly detection every 5 minutes"""
+    db = SessionLocal()  
+    try:
+        logger.info("🔍 Running anomaly detection...")
+        new_alerts = crud.run_anomaly_detection_on_all_aircraft(db)
+        
+        if new_alerts:
+            logger.warning(f"⚠️  Detected {len(new_alerts)} new anomalies!")
+            for alert in new_alerts[:5]:
+                logger.warning(f"   [{alert.severity}] {alert.alert_type}: {alert.reason}")
+        else:
+            logger.info("✅ No anomalies detected")
+    except Exception as e:
+        logger.error(f"❌ Error in anomaly detection: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        db.close()
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize database and start scheduler on startup"""
+# ============= LIFESPAN CONTEXT MANAGER =============
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handle startup and shutdown"""
+    
+    # STARTUP
     print("=" * 50)
     print("🚀 STARTUP EVENT TRIGGERED")
     print("=" * 50)
@@ -72,10 +77,18 @@ async def startup_event():
             init_db()
             print("✅ Database initialized successfully")
             
-            # START SCHEDULER - NUOVO!
-            #print("🔄 Starting background scheduler...")
-            #start_scheduler(interval_minutes=5)  # Fetch every 5 minutes
-            #print("✅ Scheduler started successfully")
+            # START ANOMALY DETECTION SCHEDULER
+            print("🔄 Starting anomaly detection scheduler...")
+            scheduler.start()
+            print("✅ Scheduler started")
+            
+            scheduler.add_job(
+                run_periodic_anomaly_detection,
+                'interval',
+                minutes=5,
+                id='anomaly_detection'
+            )
+            print("✅ Anomaly detection scheduled (every 5 minutes)")
             
         else:
             print("⚠️  Database connection failed - running in API-only mode")
@@ -91,15 +104,45 @@ async def startup_event():
     
     print("=" * 50)
     
+    yield  # Application runs here
     
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Stop scheduler on shutdown"""
+    # SHUTDOWN
     print("🛑 Shutting down...")
-    stop_scheduler()
+    scheduler.shutdown()
+    stop_scheduler()  
     print("✅ Shutdown complete")
-    
-    
+
+# ============= CREATE FASTAPI APP =============
+
+app = FastAPI(
+    title="Geospatial Intelligence Platform API",
+    description="Real-time tracking and analysis of global assets",
+    version="0.2.0",
+    lifespan=lifespan  
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Pydantic models
+class AircraftPosition(BaseModel):
+    icao24: str
+    callsign: Optional[str]
+    origin_country: str
+    longitude: float
+    latitude: float
+    altitude: Optional[float]
+    velocity: Optional[float]
+    heading: Optional[float]
+    on_ground: bool
+    last_update: datetime
+
 # ============ SCHEDULER ENDPOINTS ============
 
 @app.get("/api/scheduler/status")
@@ -119,6 +162,7 @@ async def trigger_fetch_now():
         }
     else:
         raise HTTPException(status_code=503, detail="Scheduler not running")
+
 # ============ BASIC ENDPOINTS (no database) ============
 
 @app.get("/")
@@ -318,10 +362,6 @@ def health_check():
         }
     }
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-    
 @app.get("/api/aircraft/viewport")
 async def aircraft_in_viewport(
     min_lon: float,
@@ -423,7 +463,7 @@ async def get_trajectory_endpoint(
                 }
             }
         
-        # ✅ Extract coordinates from Geography POINT field
+        # Extract coordinates from Geography POINT field
         coordinates = []
         for pos in positions:
             if pos.position:  # Geography field
@@ -514,3 +554,92 @@ async def busiest_routes(limit: int = 20):
             db.close()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+        
+# ============= ALERT ENDPOINTS =============
+        
+@app.get("/api/alerts")
+async def get_alerts(
+    severity: Optional[str] = None,
+    active_only: bool = True,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    """Get alerts with filtering"""
+    if severity:
+        alerts = crud.get_alerts_by_severity(db, severity, limit=limit)
+    else:
+        alerts = crud.get_active_alerts(db, limit=limit)
+    
+    # Convert to GeoJSON
+    result = []
+    for alert in alerts:
+        shape = to_shape(alert.position)
+        result.append({
+            "id": alert.id,
+            "type": alert.alert_type,
+            "severity": alert.severity,
+            "reason": alert.reason,
+            "aircraft_icao24": alert.aircraft_icao24,
+            "aircraft_callsign": alert.aircraft_callsign,
+            "latitude": shape.y,
+            "longitude": shape.x,
+            "detected_at": alert.detected_at.isoformat(),
+            "is_active": alert.is_active,
+            "is_acknowledged": alert.is_acknowledged,
+            "priority": alert.priority,
+            "details": alert.details or {}
+        })
+    
+    return {"alerts": result, "count": len(result)}
+
+@app.get("/api/alerts/aircraft/{icao24}")
+async def get_aircraft_alerts(icao24: str, db: Session = Depends(get_db)):
+    """Get alerts for specific aircraft"""
+    alerts = crud.get_alerts_for_aircraft(db, icao24, limit=50)
+    
+    result = []
+    for alert in alerts:
+        shape = to_shape(alert.position)
+        result.append({
+            "id": alert.id,
+            "type": alert.alert_type,
+            "severity": alert.severity,
+            "reason": alert.reason,
+            "detected_at": alert.detected_at.isoformat(),
+            "latitude": shape.y,
+            "longitude": shape.x,
+            "details": alert.details
+        })
+    
+    return {"alerts": result}
+
+@app.post("/api/alerts/{alert_id}/acknowledge")
+async def acknowledge_alert_endpoint(alert_id: int, db: Session = Depends(get_db)):
+    """Mark alert as acknowledged"""
+    alert = crud.acknowledge_alert(db, alert_id)
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return {"status": "acknowledged"}
+
+@app.post("/api/alerts/{alert_id}/resolve")
+async def resolve_alert_endpoint(alert_id: int, db: Session = Depends(get_db)):
+    """Mark alert as resolved"""
+    alert = crud.resolve_alert(db, alert_id)
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return {"status": "resolved"}
+
+@app.get("/api/alerts/stats")
+async def get_alert_stats(db: Session = Depends(get_db)):
+    """Get alert statistics"""
+    return crud.get_alert_statistics(db)
+
+@app.post("/api/alerts/detect")
+async def run_detection(db: Session = Depends(get_db)):
+    """Manually trigger anomaly detection"""
+    new_alerts = crud.run_anomaly_detection_on_all_aircraft(db)
+    return {"alerts_created": len(new_alerts)}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
