@@ -34,7 +34,7 @@ export function useAircraftData({
       const minLat = viewState.latitude - latRange;
       const maxLat = viewState.latitude + latRange;
       
-      // ✅ DYNAMIC HEATMAP RESOLUTION BASED ON ZOOM LEVEL
+      // DYNAMIC HEATMAP RESOLUTION BASED ON ZOOM LEVEL
       // This prevents giant blobs when zoomed out and too many tiny hexagons when zoomed in
       let h3Resolution: number;
       let minCount: number;

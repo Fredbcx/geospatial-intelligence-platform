@@ -284,7 +284,7 @@ def run_anomaly_detection_on_all_aircraft(db: Session):
     updated_count = 0
     
     for anomaly in detected_anomalies:
-        # CHECK if alert already exists (same aircraft + same type + still active)
+        # check if alert already exists (same aircraft + same type + still active)
         existing_alert = db.query(Alert).filter(
             Alert.aircraft_icao24 == anomaly['icao24'],
             Alert.alert_type == anomaly['type'],
@@ -293,13 +293,13 @@ def run_anomaly_detection_on_all_aircraft(db: Session):
         ).first()
         
         if existing_alert:
-            # UPDATE existing alert timestamp (anomaly still ongoing)
+            # update existing alert timestamp (anomaly still ongoing)
             existing_alert.detected_at = datetime.now(timezone.utc)
             # Optionally update position if aircraft moved
             existing_alert.position = f"POINT({anomaly['longitude']} {anomaly['latitude']})"
             updated_count += 1
         else:
-            # CREATE new alert only if doesn't exist
+            # create new alert only if doesn't exist
             alert = Alert(
                 alert_type=anomaly['type'],
                 severity=anomaly['severity'],

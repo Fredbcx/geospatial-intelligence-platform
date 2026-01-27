@@ -23,6 +23,8 @@ from spatial_queries import (
 import logging
 from geoalchemy2.shape import to_shape
 from models import Alert
+from fastapi.middleware.cors import CORSMiddleware
+
 
 logger = logging.getLogger(__name__)
 
