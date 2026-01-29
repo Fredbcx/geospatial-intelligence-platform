@@ -24,7 +24,7 @@ httpx==0.26.0
 idna==3.6
 joblib==1.5.3
 multidict==6.7.0
-numpy==2.4.1
+numpy==1.26.4
 packaging==26.0
 pandas==2.1.4
 propcache==0.4.1
@@ -41,7 +41,7 @@ pytz==2024.1
 PyYAML==6.0.3
 redis==5.0.1
 requests==2.32.3
-scikit-learn==1.8.0
+scikit-learn==1.4.0
 scipy==1.17.0
 shapely==2.0.2
 six==1.17.0

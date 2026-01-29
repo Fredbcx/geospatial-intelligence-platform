@@ -79,6 +79,25 @@ async def lifespan(app: FastAPI):
             init_db()
             print("✅ Database initialized successfully")
             
+            # ============= START OPENSKY SCHEDULER (NEW!) =============
+            print("🔄 Starting OpenSky data fetcher...")
+            try:
+                # Start scheduler with 3-minute interval (optimal for free tier)
+                # 3 min = 480 requests/day (safe without auth)
+                start_scheduler(interval_minutes=3)
+                print("✅ OpenSky scheduler started (fetching every 3 minutes)")
+                
+                # Run immediate fetch (don't wait 3 minutes)
+                print("⚡ Running immediate data fetch...")
+                from data_ingestion import fetch_and_store_aircraft_job
+                fetch_and_store_aircraft_job()  # Direct call!
+                print("✅ Initial fetch completed")
+                
+            except Exception as e:
+                print(f"⚠️  OpenSky scheduler failed to start: {e}")
+                import traceback
+                traceback.print_exc()
+            
             # START ANOMALY DETECTION SCHEDULER
             print("🔄 Starting anomaly detection scheduler...")
             scheduler.start()
@@ -111,7 +130,7 @@ async def lifespan(app: FastAPI):
     # SHUTDOWN
     print("🛑 Shutting down...")
     scheduler.shutdown()
-    stop_scheduler()  
+    stop_scheduler()  # This will stop the OpenSky BackgroundScheduler
     print("✅ Shutdown complete")
 
 # ============= CREATE FASTAPI APP =============
@@ -249,123 +268,109 @@ async def fetch_and_store_aircraft(limit: int = 100):
                         'velocity': state[9],
                         'heading': state[10],
                         'on_ground': state[8] if state[8] is not None else False,
-                        'last_update': datetime.utcnow(),
-                        'timestamp': datetime.utcnow()
+                        'last_update': datetime.utcnow()
                     }
                     
+                    # Get or create aircraft
                     aircraft = crud.get_or_create_aircraft(db, state[0], aircraft_data)
+                    
+                    # Store position
                     crud.create_aircraft_position(db, aircraft.id, aircraft_data)
                     stored_count += 1
-            
-            stats = crud.get_stats(db)
             
             return {
                 "status": "success",
                 "fetched": len(data['states']),
                 "stored": stored_count,
-                "stats": stats,
                 "timestamp": datetime.utcnow().isoformat()
             }
+            
         finally:
             db.close()
             
-    except ImportError:
-        raise HTTPException(status_code=503, detail="Database not available")
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=503, detail=f"OpenSky API error: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 @app.get("/api/aircraft")
-async def get_aircraft_from_db(bbox: Optional[str] = None, limit: int = 1000):
+async def get_aircraft(
+    bbox: Optional[str] = None,
+    limit: int = 1000  # Increased from 500 to 1000
+):
     """
-    Get aircraft from database
-    Falls back to live API if database not available
+    Get aircraft from database with optional viewport filtering
+    
+    bbox format: "min_lon,min_lat,max_lon,max_lat"
+    Example: /api/aircraft?bbox=-10,40,20,60
     """
     try:
         from database import get_db
-        import crud
-        from models import Aircraft
-        
         db = next(get_db())
         
         try:
             if bbox:
                 coords = [float(x) for x in bbox.split(',')]
                 if len(coords) != 4:
-                    raise HTTPException(status_code=400, detail="bbox format: min_lon,min_lat,max_lon,max_lat")
+                    raise HTTPException(status_code=400, detail="Invalid bbox format")
                 
                 min_lon, min_lat, max_lon, max_lat = coords
-                aircraft_list = crud.get_aircraft_in_bbox(db, min_lon, min_lat, max_lon, max_lat, limit)
+                aircraft = get_aircraft_in_viewport(db, min_lon, min_lat, max_lon, max_lat, limit)
             else:
-                aircraft_list = db.query(Aircraft).limit(limit).all()
-            
-            result = []
-            for aircraft in aircraft_list:
-                if aircraft.last_position:
-                    point = to_shape(aircraft.last_position)
-                    result.append({
-                        "icao24": aircraft.icao24,
-                        "callsign": aircraft.callsign,
-                        "origin_country": aircraft.origin_country,
-                        "longitude": point.x,
-                        "latitude": point.y,
-                        "altitude": aircraft.altitude_meters,
-                        "velocity": aircraft.velocity_mps,
-                        "heading": aircraft.heading,
-                        "on_ground": aircraft.on_ground,
-                        "last_update": aircraft.last_update.isoformat() if aircraft.last_update else None
-                    })
+                # No bbox: query recent aircraft directly (no spatial filter)
+                # World bbox (-180,180) causes PostGIS "Antipodal edge" error
+                from models import Aircraft
+                
+                recent_time = datetime.now(timezone.utc) - timedelta(minutes=10)
+                
+                aircraft_list = db.query(Aircraft).filter(
+                    Aircraft.last_update >= recent_time,
+                    Aircraft.last_position.isnot(None)
+                ).limit(limit).all()
+                
+                # Convert to GeoJSON
+                aircraft = []
+                for a in aircraft_list:
+                    try:
+                        point = to_shape(a.last_position)
+                        aircraft.append({
+                            'type': 'Feature',
+                            'properties': {
+                                'icao24': a.icao24,
+                                'callsign': a.callsign,
+                                'origin_country': a.origin_country,
+                                'altitude': a.altitude_meters,
+                                'velocity': a.velocity_mps,
+                                'heading': a.heading,
+                                'on_ground': a.on_ground,
+                                'last_update': a.last_update.isoformat() if a.last_update else None
+                            },
+                            'geometry': {
+                                'type': 'Point',
+                                'coordinates': [point.x, point.y, a.altitude_meters or 0]
+                            }
+                        })
+                    except:
+                        continue
             
             return {
-                "count": len(result),
-                "aircraft": result,
-                "source": "database",
-                "timestamp": datetime.utcnow().isoformat()
+                "type": "FeatureCollection",
+                "features": aircraft,
+                "count": len(aircraft),
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
         finally:
             db.close()
-            
-    except ImportError:
-        # Fallback to live API if database not available
-        return await get_aircraft_live(limit)
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Database error: {e}, falling back to live API")
-        return await get_aircraft_live(limit)
-
-@app.get("/api/stats")
-async def get_stats():
-    """Get database statistics"""
-    try:
-        from database import get_db
-        import crud
-        
-        db = next(get_db())
-        try:
-            stats = crud.get_stats(db)
-            return {**stats, "timestamp": datetime.utcnow().isoformat()}
-        finally:
-            db.close()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Database not available: {str(e)}")
-
-@app.get("/health")
-def health_check():
-    """Detailed health check"""
-    try:
-        from database import test_connection
-        db_status = "healthy" if test_connection() else "error"
-    except:
-        db_status = "not_available"
-    
-    return {
-        "api": "healthy",
-        "database": db_status,
-        "external_apis": {
-            "opensky": "operational"
-        }
-    }
+        logger.error(f"Error fetching aircraft: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/aircraft/viewport")
-async def aircraft_in_viewport(
+async def get_aircraft_viewport(
     min_lon: float,
     min_lat: float,
     max_lon: float,
@@ -373,15 +378,19 @@ async def aircraft_in_viewport(
     limit: int = 1000
 ):
     """
-    Get aircraft in map viewport (bounding box)
+    Frontend compatibility endpoint - viewport-based query
     
-    Example: /api/aircraft/viewport?min_lon=-10&min_lat=35&max_lon=20&max_lat=55
+    This is an alias for /api/aircraft?bbox=... with different parameter format
+    Used by frontend MapView component
+    
+    Example: /api/aircraft/viewport?min_lon=-10&min_lat=40&max_lon=20&max_lat=60
     """
     try:
         from database import get_db
         db = next(get_db())
         
         try:
+            # Use existing get_aircraft_in_viewport function
             aircraft = get_aircraft_in_viewport(
                 db, min_lon, min_lat, max_lon, max_lat, limit
             )
@@ -394,7 +403,11 @@ async def aircraft_in_viewport(
             }
         finally:
             db.close()
+            
     except Exception as e:
+        logger.error(f"Error in viewport endpoint: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/aircraft/near")
