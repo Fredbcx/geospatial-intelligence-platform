@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect } from 'react';
 import DeckGL from '@deck.gl/react';
+import { Map } from 'react-map-gl';
 import { ScatterplotLayer, PathLayer } from '@deck.gl/layers';
 import type { AircraftFeature, TrajectoryFeature } from '../types';
 import type { Alert } from '../types/alerts';
@@ -13,6 +14,9 @@ import { ViewControlPanel } from './ViewControlPanel';
 import { createAlertLayer } from './AlertLayer';
 import { cellToLatLng } from 'h3-js';
 
+// Import MapBox CSS
+import 'mapbox-gl/dist/mapbox-gl.css';
+
 const INITIAL_VIEW_STATE = {
   longitude: 12.5,
   latitude: 45.0,
@@ -21,7 +25,11 @@ const INITIAL_VIEW_STATE = {
   bearing: 0,
 };
 
-const ALTITUDE_SCALE = 1500; // 1500x for maximum visual impact
+// Altitude scaling for clear stratification
+const ALTITUDE_SCALE = 1500;
+
+// MapBox token from .env.local
+const MAPBOX_TOKEN = import.meta.env.VITE_MAPBOX_TOKEN;
 
 export default function MapView() {
   const [viewState, setViewState] = useState(INITIAL_VIEW_STATE);
@@ -160,7 +168,7 @@ export default function MapView() {
   const layers = useMemo(() => {
     const result = [];
 
-    // Aircraft layer with 3D altitude
+    // Aircraft layer with DRAMATIC 3D altitude
     if (layerVisibility.aircraft && aircraftData.length > 0) {
       result.push(
         new ScatterplotLayer<AircraftFeature>({
@@ -178,10 +186,10 @@ export default function MapView() {
           // 2D position (geographic)
           getPosition: (d) => d.geometry.coordinates,
           
-          // 3D elevation with MAXIMUM scaling for visibility
+          // CRITICAL: 3D elevation with MAXIMUM scaling for visibility
           getElevation: (d) => {
             const altitude = d.properties.altitude || 0;
-            return altitude * ALTITUDE_SCALE; // scaling
+            return altitude * ALTITUDE_SCALE;
           },
           
           getRadius: (d) => {
@@ -231,7 +239,7 @@ export default function MapView() {
       );
     }
 
-    // Trajectory layer stays 2D (geographic path only)
+    // Trajectory layer (2D geographic path only)
     if (layerVisibility.trajectories && trajectory && trajectory.geometry.coordinates.length > 0) {
       console.log('🛤️ Rendering trajectory as 2D path (geographic only)');
       
@@ -313,15 +321,6 @@ export default function MapView() {
         }}
         controller={true}
         layers={layers}
-        style={{
-          position: 'absolute',
-          width: '100%',
-          height: '100%',
-          background: '#1a1a2e',
-        }}
-        parameters={{
-          clearColor: [0.1, 0.1, 0.18, 1],
-        }}
         getTooltip={({ object, layer }) => {
           if (layer?.id === 'aircraft-layer' && object) {
             const props = object.properties;
@@ -333,7 +332,7 @@ export default function MapView() {
                 <div style="padding: 8px; background: rgba(0,0,0,0.9); color: white; border-radius: 4px;">
                   <strong>${props.callsign || props.icao24}</strong>
                   ${hasAlert ? '<span style="color: #ff3333;"> ⚠️ ALERT</span>' : ''}<br/>
-                  Country: ${props.origin_country}<br/>
+                  Registration: ${props.origin_country}<br/>
                   <strong style="color: #00ff00;">Altitude: ${props.altitude ? `${Math.round(props.altitude)}m` : 'N/A'}</strong><br/>
                   Speed: ${props.velocity ? `${Math.round(props.velocity * 3.6)} km/h` : 'N/A'}<br/>
                   <em style="color: #ffa500;">Click to show trajectory</em>
@@ -396,7 +395,57 @@ export default function MapView() {
           
           return null;
         }}
-      />
+      >
+        {/* MapBox base map */}
+        {MAPBOX_TOKEN ? (
+          <Map
+            mapboxAccessToken={MAPBOX_TOKEN}
+            mapStyle="mapbox://styles/mapbox/dark-v11"
+            style={{
+              width: '100%',
+              height: '100%',
+            }}
+          />
+        ) : (
+          // Fallback: solid background if no token
+          <div
+            style={{
+              position: 'absolute',
+              width: '100%',
+              height: '100%',
+              background: '#1a1a2e',
+            }}
+          />
+        )}
+      </DeckGL>
+
+      {/* Warning if no MapBox token */}
+      {!MAPBOX_TOKEN && (
+        <div
+          style={{
+            position: 'absolute',
+            top: '50%',
+            left: '50%',
+            transform: 'translate(-50%, -50%)',
+            background: 'rgba(255, 165, 0, 0.95)',
+            color: 'white',
+            padding: '20px',
+            borderRadius: 8,
+            textAlign: 'center',
+            maxWidth: '500px',
+            zIndex: 9999,
+          }}
+        >
+          <strong>⚠️ MapBox Token Missing</strong><br />
+          <p style={{ margin: '10px 0', fontSize: '0.9em' }}>
+            Add <code>VITE_MAPBOX_TOKEN</code> to <code>frontend/.env.local</code><br />
+            Get free token at: <a href="https://account.mapbox.com" target="_blank" rel="noopener noreferrer" style={{ color: '#4fc3f7' }}>mapbox.com</a>
+          </p>
+          <p style={{ fontSize: '0.85em', color: '#ddd' }}>
+            Currently showing aircraft on solid background
+          </p>
+        </div>
+      )}
 
       {/* Left control panel */}
       <ControlPanel

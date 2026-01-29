@@ -1,4 +1,4 @@
-# docker-compose.yml - VERSIONE FINALE PER LAPTOP
+# docker-compose.yml
 version: '3.8'
 
 services:
